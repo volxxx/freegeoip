@@ -46,7 +46,22 @@ var (
 	protocolCount = expvar.NewMap("Protocol") // HTTP or HTTPS
 
 	dns *dnsPool
+	dbP *DB
+	
+	dbL sync.Mutex
 )
+
+func getDB() *DB {
+    dbL.Lock()
+    defer dbL.Unlock()
+    return dbP
+}
+
+func setDB(db *DB) {
+    dbL.Lock()
+    defer dbL.Unlock()
+    dbP = db
+}
 
 func main() {
 	flLog := flag.String("l", "", "log to file instead of stderr")
@@ -88,6 +103,32 @@ func main() {
 			log.Fatal(http.ListenAndServe(cf.DebugSrv, nil))
 		}()
 	}
+	
+	if cf.IPDB.AutoReload {
+	    go func() {
+	        var lastModT time.Time
+	        for {
+	            info, err := os.Stat(cf.IPDB.File)
+	            if err != nil {
+	                if lastModT != nil {
+	                    modT := info.ModTime();
+	                    if modT.After(lastModT) {
+	                        st := time.Now()
+	                        db, err := openDB(cf)
+                        	if err != nil {
+                        		log.Fatal(err)
+                        	}
+                        	log.Println("IPDB reloaded in", time.Since(st))
+                            setDB(db)
+	                    }
+	                } else {
+	                    lastModT = info.ModTime()
+	                }
+	            }
+	            time.Sleep(1 * time.Minute)
+	        }
+	    }
+	}
 
 	mux := http.NewServeMux()
 	mux.Handle("/", http.FileServer(http.Dir(cf.DocumentRoot)))
@@ -98,8 +139,8 @@ func main() {
 		log.Fatal(err)
 	}
 	log.Println("IPDB cached in", time.Since(st))
-
-	lh := lookupHandler(cf, db)
+    setDB(db)
+	lh := lookupHandler(cf)
 	mux.HandleFunc("/csv/", lh)
 	mux.HandleFunc("/xml/", lh)
 	mux.HandleFunc("/json/", lh)
@@ -111,7 +152,7 @@ func main() {
 	select {}
 }
 
-func lookupHandler(cf *configFile, db *DB) http.HandlerFunc {
+func lookupHandler(cf *configFile) http.HandlerFunc {
 	var rl rateLimiter
 	if cf.Limit.MaxRequests > 0 {
 		if len(cf.Redis) > 0 {
@@ -130,7 +171,7 @@ func lookupHandler(cf *configFile, db *DB) http.HandlerFunc {
 		switch r.Method {
 		case "GET":
 			w.Header().Set("Access-Control-Allow-Origin", "*")
-			handleRequest(cf, db, rl, w, r)
+			handleRequest(cf, rl, w, r)
 		case "OPTIONS":
 			w.Header().Set("Access-Control-Allow-Origin", "*")
 			w.Header().Set("Content-Type", "text/plain")
@@ -146,7 +187,6 @@ func lookupHandler(cf *configFile, db *DB) http.HandlerFunc {
 
 func handleRequest(
 	cf *configFile,
-	db *DB,
 	rl rateLimiter,
 	w http.ResponseWriter,
 	r *http.Request,
@@ -231,7 +271,8 @@ func handleRequest(
 
 	// Query the db.
 	var record *geoipRecord
-	if record, err = db.Lookup(ip, nIP); err != nil {
+	db := getDB()
+	if db != nil; record, err = db.Lookup(ip, nIP); err != nil {
 		http.NotFound(w, r)
 		return
 	}
