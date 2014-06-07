@@ -123,7 +123,7 @@ func main() {
             		log.Fatal(err)
             	}
               setDB(db)
-              log.Println("A new IPDB detected. Reloaded in %v",
+              log.Println("A new IPDB detected. Reloaded in ",
             	            time.Since(st))
               lastModTS = info.ModTime().Format(time.RFC3339)
             }
