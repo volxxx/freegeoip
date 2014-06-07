@@ -47,8 +47,9 @@ var (
 
 	dns *dnsPool
 	dbP *DB
-	
 	dbL sync.Mutex
+	lastModTS string
+  
 )
 
 func getDB() *DB {
@@ -60,6 +61,9 @@ func getDB() *DB {
 func setDB(db *DB) {
     dbL.Lock()
     defer dbL.Unlock()
+    if(dbP != nil){
+      dbP.close()
+    }
     dbP = db
 }
 
@@ -105,29 +109,31 @@ func main() {
 	}
 	
 	if cf.IPDB.AutoReload {
-	    go func() {
-	        var lastModT time.Time
-	        for {
-	            info, err := os.Stat(cf.IPDB.File)
-	            if err != nil {
-	                if lastModT != nil {
-	                    modT := info.ModTime();
-	                    if modT.After(lastModT) {
-	                        st := time.Now()
-	                        db, err := openDB(cf)
-                        	if err != nil {
-                        		log.Fatal(err)
-                        	}
-                        	log.Println("IPDB reloaded in", time.Since(st))
-                            setDB(db)
-	                    }
-	                } else {
-	                    lastModT = info.ModTime()
-	                }
-	            }
-	            time.Sleep(1 * time.Minute)
-	        }
-	    }
+    go func() {
+      for {
+        info, err := os.Stat(cf.IPDB.File)
+        if err == nil {
+          if lastModTS != "" {
+            modT := info.ModTime()
+            lastModT, pErr := time.Parse(time.RFC3339, lastModTS)
+            if pErr == nil && modT.After(lastModT) {
+              st := time.Now()
+              db, err := openDB(cf)
+            	if err != nil {
+            		log.Fatal(err)
+            	}
+              setDB(db)
+              log.Println("A new IPDB detected. Reloaded in %v",
+            	            time.Since(st))
+              lastModTS = info.ModTime().Format(time.RFC3339)
+            }
+          }else {
+            lastModTS = info.ModTime().Format(time.RFC3339)
+          }
+        }
+        time.Sleep(20 * time.Second)
+      }
+    }()
 	}
 
 	mux := http.NewServeMux()
@@ -144,12 +150,49 @@ func main() {
 	mux.HandleFunc("/csv/", lh)
 	mux.HandleFunc("/xml/", lh)
 	mux.HandleFunc("/json/", lh)
+	ph := pingHandler(cf)
+	mux.HandleFunc("/ping/", ph)
 
 	for _, c := range cf.Listen {
 		go runServer(mux, c)
 	}
 
 	select {}
+}
+
+type pongRecord struct {
+  LastUpdate string   `json:"last_update"`
+}
+
+
+func pingHandler(cf *configFile) http.HandlerFunc {
+  return func(w http.ResponseWriter, r *http.Request) {
+		if r.TLS != nil {
+			w.Header().Set("Strict-Transport-Security", "max-age=31536000")
+		}
+		switch r.Method {
+		case "GET":
+			w.Header().Set("Access-Control-Allow-Origin", "*")
+			if(lastModTS != ""){
+			  w.Header().Set("Content-Type", "application/json")
+
+  			pong := &pongRecord{
+      	  LastUpdate: lastModTS,   	  
+      	}
+      	json.NewEncoder(w).Encode(pong)
+			}
+
+		case "OPTIONS":
+			w.Header().Set("Access-Control-Allow-Origin", "*")
+			w.Header().Set("Content-Type", "text/plain")
+			w.Header().Set("Access-Control-Allow-Methods", "GET")
+			w.Header().Set("Access-Control-Allow-Headers", "X-Requested-With")
+			w.WriteHeader(200)
+		default:
+			w.Header().Set("Allow", "GET, OPTIONS")
+			http.Error(w, http.StatusText(405), 405)
+		}
+	}
 }
 
 func lookupHandler(cf *configFile) http.HandlerFunc {
@@ -272,7 +315,7 @@ func handleRequest(
 	// Query the db.
 	var record *geoipRecord
 	db := getDB()
-	if db != nil; record, err = db.Lookup(ip, nIP); err != nil {
+	if record, err = db.Lookup(ip, nIP); err != nil {
 		http.NotFound(w, r)
 		return
 	}
@@ -435,6 +478,20 @@ func openDB(cf *configFile) (*DB, error) {
 		return nil, err
 	}
 	return &db, nil
+}
+
+func (db *DB) close() error {
+  // clear cache
+  defer runtime.GC()
+  db.country = nil
+  db.region = nil
+  db.city = nil
+  
+  err := db.db.Close()
+  if err!= nil {
+    return err
+  }
+  return nil
 }
 
 func (db *DB) loadCache() error {
@@ -838,6 +895,7 @@ type configFile struct {
 	IPDB struct {
 		File      string `xml:",attr"`
 		CacheSize string `xml:",attr"`
+		AutoReload bool `xml:",attr"`
 	}
 
 	Limit struct {
