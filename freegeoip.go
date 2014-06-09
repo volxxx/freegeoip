@@ -45,26 +45,25 @@ var (
 	statusCount   = expvar.NewMap("Status")   // 200, 403, 404, etc
 	protocolCount = expvar.NewMap("Protocol") // HTTP or HTTPS
 
-	dns *dnsPool
-	dbP *DB
-	dbL sync.Mutex
-	lastModTS string
-  
+	dns      *dnsPool
+	dbP      *DB
+	dbL      sync.Mutex
+	lastModT time.Time
 )
 
-func getDB() *DB {
-    dbL.Lock()
-    defer dbL.Unlock()
-    return dbP
+func db() *DB {
+	dbL.Lock()
+	defer dbL.Unlock()
+	return dbP
 }
 
 func setDB(db *DB) {
-    dbL.Lock()
-    defer dbL.Unlock()
-    if(dbP != nil){
-      dbP.close()
-    }
-    dbP = db
+	dbL.Lock()
+	defer dbL.Unlock()
+	if dbP != nil {
+		dbP.close()
+	}
+	dbP = db
 }
 
 func main() {
@@ -107,45 +106,42 @@ func main() {
 			log.Fatal(http.ListenAndServe(cf.DebugSrv, nil))
 		}()
 	}
-	
-	if cf.IPDB.AutoReload {
-    go func() {
-      for {
-        info, err := os.Stat(cf.IPDB.File)
-        if err == nil {
-          if lastModTS != "" {
-            modT := info.ModTime()
-            lastModT, pErr := time.Parse(time.RFC3339, lastModTS)
-            if pErr == nil && modT.After(lastModT) {
-              st := time.Now()
-              db, err := openDB(cf)
-            	if err != nil {
-            		log.Fatal(err)
-            	}
-              setDB(db)
-              log.Println("A new IPDB detected. Reloaded in ",
-            	            time.Since(st))
-              lastModTS = info.ModTime().Format(time.RFC3339)
-            }
-          }else {
-            lastModTS = info.ModTime().Format(time.RFC3339)
-          }
-        }
-        time.Sleep(20 * time.Second)
-      }
-    }()
+
+	if cf.IPDB.AutoReloadInSecs > 0 {
+		go func() {
+			for {
+				info, err := os.Stat(cf.IPDB.File)
+				if err == nil {
+					modT := info.ModTime()
+					if modT.After(lastModT) {
+						st := time.Now()
+						if err = loadDB(cf); err == nil {
+							log.Println("A new IPDB reloaded in ",
+								time.Since(st))
+							lastModT = info.ModTime()
+						}
+					}
+				}
+				if err != nil {
+					log.Fatal(err)
+					return
+				}
+				time.Sleep(time.Duration(cf.IPDB.AutoReloadInSecs) * time.Second)
+			}
+		}()
+	} else {
+		st := time.Now()
+		db, err := openDB(cf)
+		if err != nil {
+			log.Fatal(err)
+		}
+		log.Println("IPDB cached in", time.Since(st))
+		setDB(db)
 	}
 
 	mux := http.NewServeMux()
 	mux.Handle("/", http.FileServer(http.Dir(cf.DocumentRoot)))
 
-	st := time.Now()
-	db, err := openDB(cf)
-	if err != nil {
-		log.Fatal(err)
-	}
-	log.Println("IPDB cached in", time.Since(st))
-    setDB(db)
 	lh := lookupHandler(cf)
 	mux.HandleFunc("/csv/", lh)
 	mux.HandleFunc("/xml/", lh)
@@ -161,25 +157,24 @@ func main() {
 }
 
 type pongRecord struct {
-  LastUpdate string   `json:"last_update"`
+	LastUpdate string `json:"last_update"`
 }
 
-
 func pingHandler(cf *configFile) http.HandlerFunc {
-  return func(w http.ResponseWriter, r *http.Request) {
+	return func(w http.ResponseWriter, r *http.Request) {
 		if r.TLS != nil {
 			w.Header().Set("Strict-Transport-Security", "max-age=31536000")
 		}
 		switch r.Method {
 		case "GET":
 			w.Header().Set("Access-Control-Allow-Origin", "*")
-			if(lastModTS != ""){
-			  w.Header().Set("Content-Type", "application/json")
+			if !lastModT.IsZero() {
+				w.Header().Set("Content-Type", "application/json")
 
-  			pong := &pongRecord{
-      	  LastUpdate: lastModTS,   	  
-      	}
-      	json.NewEncoder(w).Encode(pong)
+				pong := &pongRecord{
+					LastUpdate: lastModT.Format(time.RFC850),
+				}
+				json.NewEncoder(w).Encode(pong)
 			}
 
 		case "OPTIONS":
@@ -314,7 +309,7 @@ func handleRequest(
 
 	// Query the db.
 	var record *geoipRecord
-	db := getDB()
+	db := db()
 	if record, err = db.Lookup(ip, nIP); err != nil {
 		http.NotFound(w, r)
 		return
@@ -450,6 +445,15 @@ type locationData struct {
 	AreaCode string
 }
 
+func loadDB(cf *configFile) error {
+	db, err := openDB(cf)
+	if err != nil {
+		return err
+	}
+	setDB(db)
+	return nil
+}
+
 func openDB(cf *configFile) (*DB, error) {
 	var (
 		db  DB
@@ -481,17 +485,17 @@ func openDB(cf *configFile) (*DB, error) {
 }
 
 func (db *DB) close() error {
-  // clear cache
-  defer runtime.GC()
-  db.country = nil
-  db.region = nil
-  db.city = nil
-  
-  err := db.db.Close()
-  if err!= nil {
-    return err
-  }
-  return nil
+	// clear cache
+	defer runtime.GC()
+	db.country = nil
+	db.region = nil
+	db.city = nil
+
+	err := db.db.Close()
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
 func (db *DB) loadCache() error {
@@ -893,9 +897,9 @@ type configFile struct {
 	}
 
 	IPDB struct {
-		File      string `xml:",attr"`
-		CacheSize string `xml:",attr"`
-		AutoReload bool `xml:",attr"`
+		File             string `xml:",attr"`
+		CacheSize        string `xml:",attr"`
+		AutoReloadInSecs int    `xml:",attr"`
 	}
 
 	Limit struct {
