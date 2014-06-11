@@ -49,14 +49,14 @@ def extract(zipfd, zipname, filename=None):
     print "Extracting " + filename
 
     try:
-        data = zipfd.read(zipname)
+        stream = zipfd.open(zipname)
+        fd = open(filename, "w")
+        for data in stream:
+            fd.write(data)
+        fd.close()
     except KeyError:
         print "Could not extract %s from zip archive." % zipname
         sys.exit(1)
-    else:
-        fd = open(filename, "w")
-        fd.write(data)
-        fd.close()
 
 
 def import_csv(cursor, csvfile, table, skip_lines=0):
