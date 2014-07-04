@@ -37,6 +37,8 @@ import (
 	// SQLite driver.
 	// _ "github.com/mattn/go-sqlite3"
 	_ "code.google.com/p/gosqlite/sqlite3"
+
+	auth "github.com/abbot/go-http-auth"
 )
 
 var (
@@ -49,6 +51,7 @@ var (
 	dbP      *DB
 	dbL      sync.Mutex
 	lastModT time.Time
+	ut       usageTracker
 )
 
 func db() *DB {
@@ -141,11 +144,15 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.Handle("/", http.FileServer(http.Dir(cf.DocumentRoot)))
-
-	lh := lookupHandler(cf)
+	secrets := auth.HtpasswdFileProvider(cf.Limit.APIKeyFile)
+	authenticator := auth.NewBasicAuthenticator("api", secrets)
+	lh := auth.JustCheck(authenticator, lookupHandler(cf))
+	qh := auth.JustCheck(authenticator, quotaHandler(cf))
 	mux.HandleFunc("/csv/", lh)
 	mux.HandleFunc("/xml/", lh)
 	mux.HandleFunc("/json/", lh)
+	mux.HandleFunc("/quota/", qh)
+
 	ph := pingHandler(cf)
 	mux.HandleFunc("/ping/", ph)
 
@@ -154,6 +161,47 @@ func main() {
 	}
 
 	select {}
+}
+
+type quotaRecord struct {
+	Since string `json:"since"`
+	Quota int    `json:"quota"`
+}
+
+func quotaHandler(cf *configFile) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.TLS != nil {
+			w.Header().Set("Strict-Transport-Security", "max-age=31536000")
+		}
+		switch r.Method {
+		case "GET":
+			w.Header().Set("Access-Control-Allow-Origin", "*")
+			if ut != nil {
+				w.Header().Set("Content-Type", "application/json")
+				clientID := r.Header.Get("X-Authenticated-Username")
+				since, err := ut.Since()
+				quota, err := ut.LookUp(clientID)
+				if err != nil {
+					log.Panicln(err)
+				}
+				quotaR := &quotaRecord{
+					Since: since.Format(time.RFC850),
+					Quota: quota,
+				}
+				json.NewEncoder(w).Encode(quotaR)
+			}
+
+		case "OPTIONS":
+			w.Header().Set("Access-Control-Allow-Origin", "*")
+			w.Header().Set("Content-Type", "text/plain")
+			w.Header().Set("Access-Control-Allow-Methods", "GET")
+			w.Header().Set("Access-Control-Allow-Headers", "X-Requested-With")
+			w.WriteHeader(200)
+		default:
+			w.Header().Set("Allow", "GET, OPTIONS")
+			http.Error(w, http.StatusText(405), 405)
+		}
+	}
 }
 
 type pongRecord struct {
@@ -202,6 +250,22 @@ func lookupHandler(cf *configFile) http.HandlerFunc {
 		}
 		rl.init(cf)
 	}
+
+	if cf.Limit.APIKeyFile != "" && ut == nil {
+		if len(cf.Redis) > 0 {
+			ut = new(redisQuota)
+			ut.init(cf)
+		} else {
+			log.Printf("No redis setting escaping tracking api usage.")
+		}
+
+		if ut != nil {
+
+			log.Printf("Using redis to track api usage: %s", cf.Redis)
+		}
+
+	}
+
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.TLS != nil {
 			w.Header().Set("Strict-Transport-Security", "max-age=31536000")
@@ -209,7 +273,7 @@ func lookupHandler(cf *configFile) http.HandlerFunc {
 		switch r.Method {
 		case "GET":
 			w.Header().Set("Access-Control-Allow-Origin", "*")
-			handleRequest(cf, rl, w, r)
+			handleRequest(cf, rl, ut, w, r)
 		case "OPTIONS":
 			w.Header().Set("Access-Control-Allow-Origin", "*")
 			w.Header().Set("Content-Type", "text/plain")
@@ -226,9 +290,18 @@ func lookupHandler(cf *configFile) http.HandlerFunc {
 func handleRequest(
 	cf *configFile,
 	rl rateLimiter,
+	ut usageTracker,
 	w http.ResponseWriter,
 	r *http.Request,
 ) {
+	clientID := r.Header.Get("X-Authenticated-Username")
+	if clientID != "" && ut != nil {
+		err := ut.Incr(clientID)
+		if err != nil {
+			log.Panicln(err)
+		}
+	}
+
 	// If xheaders is enabled, RemoteAddr might be a copy of
 	// the X-Real-IP or X-Forwarded-For HTTP headers, which
 	// can be a comma separated list of IPs. In this case,
@@ -708,6 +781,13 @@ func (r *geoipRecord) CSV(w io.Writer) {
 	)
 }
 
+type usageTracker interface {
+	init(cf *configFile)                 // Initialize backend
+	Incr(clientID string) error          // incrementor
+	LookUp(clientID string) (int, error) // look up for usage
+	Since() (time.Time, error)           // get the timestamp when started to track
+}
+
 type rateLimiter interface {
 	init(cf *configFile)           // Initialize backend
 	Ok(ipkey uint32) (bool, error) // Returns true if under quota
@@ -745,17 +825,22 @@ func (q *mapQuota) Ok(ipkey uint32) (bool, error) {
 	return true, nil
 }
 
-// redisQuota implements the rateLimiter interface using Redis as the backend.
+// redisQuota implements the rateLimiter AND usageTracker interface using Redis as the backend.
 type redisQuota struct {
-	cf *configFile
-	rc *redis.Client
+	cf       *configFile
+	rc       *redis.Client
+	initFlag bool
 }
 
 func (q *redisQuota) init(cf *configFile) {
-	redis.MaxIdleConnsPerAddr = 5000
-	q.cf = cf
-	q.rc = redis.New(cf.Redis...)
-	q.rc.Timeout = time.Duration(1500) * time.Millisecond
+	if !q.initFlag {
+		redis.MaxIdleConnsPerAddr = 5000
+		q.cf = cf
+		q.rc = redis.New(cf.Redis...)
+		q.rc.Timeout = time.Duration(1500) * time.Millisecond
+		q.initFlag = true
+	}
+
 }
 
 func (q *redisQuota) Ok(ipkey uint32) (bool, error) {
@@ -776,6 +861,51 @@ func (q *redisQuota) Ok(ipkey uint32) (bool, error) {
 		return false, nil
 	}
 	return true, nil
+}
+
+func (q *redisQuota) Incr(clientID string) error {
+
+	k := clientID
+
+	if ns, err := q.rc.Get(k); err != nil {
+		return fmt.Errorf("redis get: %s", err)
+	} else if ns == "" {
+		if err = q.rc.Set(k, "1"); err != nil {
+			return fmt.Errorf("redis setex: %s", err)
+		}
+	} else {
+		if _, err := q.rc.Incr(k); err != nil {
+			return fmt.Errorf("redis incr: %s", err)
+		}
+	}
+
+	return nil
+}
+
+func (q *redisQuota) LookUp(clientID string) (int, error) {
+	k := clientID
+
+	if ns, err := q.rc.Get(k); err != nil {
+		return 0, fmt.Errorf("redis get: %s", err)
+	} else if ns == "" {
+		// no usage yet
+		return 0, nil
+	} else {
+		n, _ := strconv.Atoi(ns)
+		return n, nil
+	}
+}
+
+func (q *redisQuota) Since() (time.Time, error) {
+	k := q.cf.Reserved.UsageTrackStartAtKeyName
+	var since time.Time
+	if ns, err := q.rc.Get(k); err != nil {
+		return since, fmt.Errorf("redis get: %s", err)
+	} else {
+		sinceInt, err := strconv.ParseInt(ns, 10, 64)
+		since = time.Unix(sinceInt, 0)
+		return since, err
+	}
 }
 
 func ip2int(ip net.IP) (uint32, error) {
@@ -903,8 +1033,13 @@ type configFile struct {
 	}
 
 	Limit struct {
-		MaxRequests int `xml:",attr"`
-		Expire      int `xml:",attr"`
+		MaxRequests int    `xml:",attr"`
+		Expire      int    `xml:",attr"`
+		APIKeyFile  string `xml:",attr"`
+	}
+	// Reserved redis key-value pair for freegeoip server
+	Reserved struct {
+		UsageTrackStartAtKeyName string `xml:",attr"`
 	}
 
 	Redis []string `xml:"Redis>Addr"`
@@ -924,6 +1059,8 @@ func loadConfig(filename string) (*configFile, error) {
 	basedir := filepath.Dir(filename)
 	relativePath(basedir, &cf.IPDB.File)
 	relativePath(basedir, &cf.DocumentRoot)
+	relativePath(basedir, &cf.Limit.APIKeyFile)
+
 	for _, l := range cf.Listen {
 		relativePath(basedir, &l.CertFile)
 		relativePath(basedir, &l.KeyFile)
